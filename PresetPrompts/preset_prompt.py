@@ -4,8 +4,10 @@ import json
 import random
 import re
 import traceback
+from collections import OrderedDict # キーの順序をある程度保持するために使用
 
 # --- Helper Function ---
+# ... (変更なし) ...
 def _parse_specific_choices(choices_str):
     """Helper function to parse comma or newline separated strings into a list."""
     if not choices_str or not choices_str.strip():
@@ -13,29 +15,70 @@ def _parse_specific_choices(choices_str):
     items = re.split(r'\s*,\s*|\s*\n\s*', choices_str.strip())
     return [item.strip() for item in items if item.strip()]
 
-# --- Load Preset Data ---
+
+# --- Load Preset Data & Dynamically Determine Categories ---
 PRESETS = {}
 PRESET_FILE_PATH = os.path.join(os.path.dirname(__file__), 'presets.json')
+# このリストはJSONから動的に生成します
+_AVAILABLE_CATEGORIES = [] # モジュールレベルで定義
 
 try:
     if os.path.exists(PRESET_FILE_PATH):
         with open(PRESET_FILE_PATH, 'r', encoding='utf-8') as f:
-            PRESETS = json.load(f)
+            # OrderedDictを使用してキーの順序を（可能な限り）保持
+            PRESETS = json.load(f, object_pairs_hook=OrderedDict)
+
             if "None" not in PRESETS:
-                 PRESETS["None"] = {"_description": "Fallback None preset"}
+                 PRESETS["None"] = OrderedDict([("_description", "Fallback None preset")])
             print(f"[PresetPrompts] Loaded {len(PRESETS)} presets from {PRESET_FILE_PATH}")
+
+            # --- Dynamically determine available categories ---
+            all_category_keys = set()
+            # 全てのプリセット(None除く)を走査してカテゴリキーを収集
+            for preset_name, data in PRESETS.items():
+                # Noneプリセットや、予期せず辞書でないデータはスキップ
+                if preset_name != "None" and isinstance(data, dict):
+                    # アンダースコアで始まらないキーをカテゴリ候補とする
+                    valid_keys = {key for key in data.keys() if not key.startswith('_')}
+                    all_category_keys.update(valid_keys)
+
+            # 順序をある程度定義するため、最初に登場した非Noneプリセットのキー順をベースにする
+            ordered_categories = []
+            first_preset_key_order = []
+            for preset_name, data in PRESETS.items():
+                if preset_name != "None" and isinstance(data, dict):
+                     first_preset_key_order = [k for k in data.keys() if not k.startswith('_')]
+                     break # 最初の有効なプリセットのキー順を取得したら抜ける
+
+            # 取得した順序でカテゴリを追加
+            added_keys = set()
+            for key in first_preset_key_order:
+                if key in all_category_keys:
+                    ordered_categories.append(key)
+                    added_keys.add(key)
+
+            # 最初のプリセットに含まれていなかったカテゴリを残りに追加（例: アルファベット順）
+            remaining_keys = sorted(list(all_category_keys - added_keys))
+            ordered_categories.extend(remaining_keys)
+
+            _AVAILABLE_CATEGORIES = ordered_categories # モジュールレベル変数に最終的なカテゴリリストを格納
+            print(f"[PresetPrompts] Dynamically determined categories: {_AVAILABLE_CATEGORIES}")
+
     else:
         print(f"[PresetPrompts] Warning: Preset file not found at {PRESET_FILE_PATH}. Creating default 'None' preset.")
-        PRESETS = {"None": {"_description": "Default None preset"}}
+        PRESETS = {"None": OrderedDict([("_description", "Default None preset")])}
+        _AVAILABLE_CATEGORIES = [] # カテゴリなし
+
 except json.JSONDecodeError as e:
     print(f"[PresetPrompts] Error loading presets.json: {e}")
-    print(f"[PresetPrompts] Please check the JSON syntax in {PRESET_FILE_PATH}")
     traceback.print_exc()
-    PRESETS = {"None": {"_description": "Error Loading Presets"}}
+    PRESETS = {"None": OrderedDict([("_description", "Error Loading Presets")])}
+    _AVAILABLE_CATEGORIES = []
 except Exception as e:
     print(f"[PresetPrompts] An unexpected error occurred loading presets: {e}")
     traceback.print_exc()
-    PRESETS = {"None": {"_description": "Error Loading Presets"}}
+    PRESETS = {"None": OrderedDict([("_description", "Error Loading Presets")])}
+    _AVAILABLE_CATEGORIES = []
 
 
 # --- Node Class Definition ---
@@ -45,19 +88,19 @@ class PresetPromptGenerator:
     RETURN_NAMES = ("prompt",)
     FUNCTION = "generate_preset_prompt"
 
-    # Define the order AND the categories that can be toggled
-    PRESET_CATEGORY_ORDER = [
-        "keywords", "character_details", "clothing", "accessories",
-        "pose", "expression", "lighting", "background"
-    ]
+    # PRESET_CATEGORY_ORDER はもう使いません (動的に決定するため)
+    # PRESET_CATEGORY_ORDER = [...]
 
     @classmethod
     def INPUT_TYPES(cls):
+        # PRESETS と _AVAILABLE_CATEGORIES はモジュールレベルでロード済み
         preset_names = list(PRESETS.keys())
         if not preset_names:
             preset_names = ["None"]
 
+        # 基本的な必須入力を定義
         required = {
+            "randomize_preset": ("BOOLEAN", {"default": False}),
             "preset_name": (preset_names,),
             "prefix_tags": ("STRING", {"multiline": True, "default": "masterpiece, best quality"}),
             "character": ("STRING", {"multiline": False, "default": ""}),
@@ -65,36 +108,43 @@ class PresetPromptGenerator:
             "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
         }
 
-        # --- Add category toggle inputs ---
-        for category in cls.PRESET_CATEGORY_ORDER:
+        # --- Dynamically add category toggle inputs based on _AVAILABLE_CATEGORIES ---
+        print(f"[PresetPrompts] Generating inputs for categories: {_AVAILABLE_CATEGORIES}") # デバッグ用
+        for category in _AVAILABLE_CATEGORIES: # モジュールレベルで決定したカテゴリリストを使用
             input_name = f"enable_{category}"
-            # Add category toggle with default True (enabled)
-            required[input_name] = ("BOOLEAN", {"default": True})
-            # You could also place these in "optional" if preferred
+            # 対応するBOOLEAN入力をrequiredに追加
+            required[input_name] = ("BOOLEAN", {"default": True}) # デフォルトで有効にする
 
-        return {"required": required} # Return combined inputs
+        return {"required": required}
 
-    # **** IMPORTANT: Add all the new boolean flags to the function signature ****
-    def generate_preset_prompt(self, preset_name, prefix_tags, character, suffix_tags, seed,
-                               # Add arguments matching the new inputs
-                               enable_keywords, enable_character_details, enable_clothing,
-                               enable_accessories, enable_pose, enable_expression,
-                               enable_lighting, enable_background): # Ensure all categories from PRESET_CATEGORY_ORDER are listed here
+    # **** Use **kwargs to accept dynamically generated enable inputs ****
+    def generate_preset_prompt(self, randomize_preset, preset_name,
+                               prefix_tags, character, suffix_tags, seed,
+                               **kwargs): # 固定のenable引数の代わりにkwargsを使用
 
         rng = random.Random(seed)
         prompt_parts = []
 
-        # Create a mapping from category name to its enable flag for easy lookup
-        enable_flags = {
-            "keywords": enable_keywords,
-            "character_details": enable_character_details,
-            "clothing": enable_clothing,
-            "accessories": enable_accessories,
-            "pose": enable_pose,
-            "expression": enable_expression,
-            "lighting": enable_lighting,
-            "background": enable_background,
-        }
+        # --- Determine the actual preset name to use ---
+        actual_preset_name = preset_name
+        if randomize_preset:
+            available_presets = [name for name in PRESETS.keys() if name != "None"]
+            if available_presets:
+                actual_preset_name = rng.choice(available_presets)
+                # print(f"[PresetPrompts] Randomly selected preset: {actual_preset_name}") # Optional debug log
+            else:
+                # print("[PresetPrompts] Warning: No presets for randomization. Using 'None'.") # Optional debug log
+                actual_preset_name = "None"
+        # print(f"[PresetPrompts] Using preset: {actual_preset_name}") # Optional debug log
+
+        # --- Dynamically build the enable_flags dictionary from kwargs ---
+        enable_flags = {}
+        # Use the globally determined _AVAILABLE_CATEGORIES to know which flags to look for
+        for category in _AVAILABLE_CATEGORIES: # モジュールレベルのカテゴリリストを使用
+            enable_key = f"enable_{category}"
+            # kwargsから対応する値を取得。なければデフォルトのTrueを使用
+            # (INPUT_TYPESのデフォルト値と合わせる)
+            enable_flags[category] = kwargs.get(enable_key, True)
 
         # 1. Add Prefix Tags
         prompt_parts.extend(_parse_specific_choices(prefix_tags))
@@ -104,18 +154,22 @@ class PresetPromptGenerator:
             prompt_parts.extend(_parse_specific_choices(character))
 
         # 3. Process Selected Preset
-        selected_preset_data = PRESETS.get(preset_name)
+        selected_preset_data = PRESETS.get(actual_preset_name)
 
-        if selected_preset_data and preset_name != "None":
-            # Iterate through categories in defined order
-            for category in self.PRESET_CATEGORY_ORDER:
-                # **** Check if this category is enabled ****
-                if enable_flags.get(category, False): # Check the flag (default to False if somehow missing)
-                    tag_options = selected_preset_data.get(category, [])
+        if selected_preset_data and actual_preset_name != "None" and isinstance(selected_preset_data, dict):
+            # Iterate through categories based on the dynamically determined order
+            for category in _AVAILABLE_CATEGORIES: # モジュールレベルのカテゴリリストを使用
+                # Check if this category is enabled via the dynamically built flags
+                if enable_flags.get(category, False): # 安全のため .get() を使用
+                    tag_options = selected_preset_data.get(category, []) # プリセットからこのカテゴリのタグを取得
+                    # Ensure tag_options is a list before choosing
                     if isinstance(tag_options, list) and tag_options:
                         chosen_tag = rng.choice(tag_options)
-                        if chosen_tag and chosen_tag.strip():
+                        if chosen_tag and isinstance(chosen_tag, str) and chosen_tag.strip(): # Ensure tag is a non-empty string
                              prompt_parts.append(chosen_tag.strip())
+                    # elif not isinstance(tag_options, list):
+                        # Optional: Log a warning if a category value isn't a list
+                        # print(f"[PresetPrompts] Warning: Category '{category}' in preset '{actual_preset_name}' is not a list.")
 
         # 4. Add Suffix Tags
         prompt_parts.extend(_parse_specific_choices(suffix_tags))
@@ -135,4 +189,5 @@ class PresetPromptGenerator:
 
         return (final_prompt,)
 
-# Make sure __init__.py correctly imports this class and defines mappings
+# Ensure __init__.py correctly imports this class and defines mappings
+# ( __init__.py は変更不要です )
